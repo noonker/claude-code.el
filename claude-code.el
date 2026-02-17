@@ -35,9 +35,28 @@
   "Window management settings for Claude Code."
   :group 'claude-code)
 
+(defgroup claude-code-audio nil
+  "Audio tasking settings for Claude Code."
+  :group 'claude-code)
+
 (defface claude-code-repl-face
   nil
   "Face for Claude REPL."
+  :group 'claude-code)
+
+(defface claude-code-session-status-working-face
+  '((t :foreground "orange" :weight bold))
+  "Face for Working status in the session list."
+  :group 'claude-code)
+
+(defface claude-code-session-status-waiting-face
+  '((t :foreground "green" :weight bold))
+  "Face for Needs Input status in the session list."
+  :group 'claude-code)
+
+(defface claude-code-session-status-dead-face
+  '((t :foreground "red"))
+  "Face for Dead status in the session list."
   :group 'claude-code)
 
 (defcustom claude-code-term-name "xterm-256color"
@@ -154,6 +173,14 @@ When nil, Claude instances will be killed without confirmation."
   :type 'boolean
   :group 'claude-code)
 
+(defcustom claude-code-session-list-auto-refresh-interval 2
+  "Number of seconds between auto-refreshes of the session list buffer.
+
+Set to nil to disable auto-refresh."
+  :type '(choice (const :tag "Disabled" nil)
+                 (number :tag "Seconds"))
+  :group 'claude-code)
+
 (defcustom claude-code-optimize-window-resize t
   "Whether to optimize terminal window resizing to prevent unnecessary reflows.
 
@@ -192,6 +219,33 @@ Claude buffer when toggling it open.  When nil, the buffer will be
 displayed but focus will remain in the current buffer."
   :type 'boolean
   :group 'claude-code-window)
+
+;;;;; Audio tasking customizations
+
+(defcustom claude-code-audio-tasking-auto-listen t
+  "Whether to automatically start whisper recording when Claude awaits input.
+
+When non-nil and audio tasking is enabled for a session, `whisper-run'
+will be called automatically after TTS announces that Claude is ready.
+Requires the `whisper' package to be installed."
+  :type 'boolean
+  :group 'claude-code-audio)
+
+(defcustom claude-code-audio-tts-program nil
+  "Program to use for text-to-speech.
+
+If nil, automatically selects `say' on macOS or `espeak' on Linux."
+  :type '(choice (const :tag "Auto-detect" nil) string)
+  :group 'claude-code-audio)
+
+(defcustom claude-code-audio-tts-args nil
+  "Additional arguments to pass to the TTS program.
+
+These are prepended before the text argument.  For example, you
+could use \\='(\"-v\" \"Samantha\") with `say' on macOS to select
+a specific voice."
+  :type '(repeat string)
+  :group 'claude-code-audio)
 
 ;;;;; Eat terminal customizations
 ;; Eat-specific terminal faces
@@ -348,6 +402,9 @@ between reducing flickering and maintaining responsiveness."
 ;;;; Forward declarations for server
 (defvar server-eval-args-left)
 
+;;;; Forward declarations for whisper
+(declare-function whisper-run "whisper")
+
 ;;;; Internal state variables
 (defvar claude-code--directory-buffer-map (make-hash-table :test 'equal)
   "Hash table mapping directories to user-selected Claude buffers.
@@ -364,6 +421,35 @@ This is separate from Emacs' main variable `command-history' to prevent
 pollution when using `savehist-mode'.  Users can optionally save
 this history by adding `claude-code-command-history' to
 `savehist-additional-variables'.")
+
+(defvar-local claude-code--session-status 'waiting
+  "Current status of the Claude session in this buffer.
+
+Possible values are `running', `waiting', or `dead'.")
+
+(defvar-local claude-code--turn-start-time nil
+  "Timestamp when the current turn started.
+
+Recorded when status transitions to `running', cleared when it
+transitions to `waiting'.")
+
+(defvar-local claude-code--last-turn-duration nil
+  "Duration in seconds of the last completed turn.")
+
+(defvar-local claude-code--session-summary nil
+  "Summary of the last user prompt sent to this session.")
+
+(defvar-local claude-code--audio-tasking nil
+  "Whether audio tasking is enabled for this Claude session.")
+
+(defvar claude-code--audio-tasking-target-buffer nil
+  "Claude buffer currently awaiting whisper voice input.")
+
+(defvar claude-code--session-list-buffer-name "*Claude Sessions*"
+  "Name of the session list buffer.")
+
+(defvar claude-code--session-list-timer nil
+  "Timer for auto-refreshing the session list.")
 
 ;;;; Key bindings
 ;;;###autoload (autoload 'claude-code-command-map "claude-code")
@@ -395,6 +481,8 @@ this history by adding `claude-code-command-history' to
     (define-key map (kbd "3") 'claude-code-send-3)
     (define-key map (kbd "M") 'claude-code-cycle-mode)
     (define-key map (kbd "o") 'claude-code-send-buffer-file)
+    (define-key map (kbd "l") 'claude-code-session-list)
+    (define-key map (kbd "a") 'claude-code-toggle-audio-tasking)
     map)
   "Keymap for Claude commands.")
 
@@ -425,7 +513,9 @@ this history by adding `claude-code-command-history' to
     ("t" "Toggle claude window" claude-code-toggle)
     ("b" "Switch to Claude buffer" claude-code-switch-to-buffer)
     ("B" "Select from all Claude buffers" claude-code-select-buffer)
+    ("l" "Session list" claude-code-session-list)
     ("z" "Toggle read-only mode" claude-code-toggle-read-only-mode)
+    ("a" "Toggle audio tasking" claude-code-toggle-audio-tasking)
     ("M" "Cycle Claude mode" claude-code-cycle-mode :transient t)
     ]
    ["Quick Responses"
@@ -471,6 +561,35 @@ this history by adding `claude-code-command-history' to
    ["Support"
     ("b" "Bug" (lambda () (interactive) (claude-code--do-send-command "/bug")))]
    ])
+
+;;;###autoload (autoload 'claude-code-session-list-transient "claude-code" nil t)
+(transient-define-prefix claude-code-session-list-transient ()
+  "Session list command menu."
+  ["Session List"
+   ["Session at Point"
+    ("RET" "Switch to session" claude-code-session-list-switch-to-session)
+    ("o" "Display session" claude-code-session-list-display-session)
+    ("s" "Send command" claude-code-session-list-send-command)
+    ("z" "Toggle read-only" claude-code-session-list-toggle-read-only)
+    ("a" "Toggle audio tasking" claude-code-session-list-toggle-audio-tasking)
+    ("/" "Slash commands" claude-code-session-list-slash-commands)]
+   ["Quick Responses"
+    ("y" "Send <return> (yes)" claude-code-session-list-send-return)
+    ("n" "Send <escape> (no)" claude-code-session-list-send-escape)
+    ("1" "Send \"1\"" claude-code-session-list-send-1)
+    ("2" "Send \"2\"" claude-code-session-list-send-2)
+    ("3" "Send \"3\"" claude-code-session-list-send-3)]
+   ["Manage"
+    ("k" "Kill session" claude-code-session-list-kill-session)
+    ("K" "Kill all sessions" claude-code-session-list-kill-all)
+    ("g" "Refresh" claude-code-session-list-refresh)]
+   ["Start New Session"
+    ("c" "Start Claude" claude-code)
+    ("C" "Continue conversation" claude-code-continue)
+    ("R" "Resume session" claude-code-resume)
+    ("i" "New instance" claude-code-new-instance)
+    ("d" "Start in directory" claude-code-start-in-directory)
+    ("S" "Sandbox" claude-code-sandbox)]])
 
 ;;;; Terminal abstraction layer
 ;; This layer abstracts terminal operations to support multiple backends (eat, vterm, etc.)
@@ -1185,6 +1304,8 @@ Returns the selected Claude buffer or nil."
           ;; Send Return
           (claude-code--term-send-string claude-code-terminal-backend (kbd "RET"))
           (display-buffer claude-code-buffer))
+        (claude-code--update-session-summary claude-code-buffer cmd)
+        (claude-code--set-session-status claude-code-buffer 'running)
         claude-code-buffer)
     (claude-code--show-not-running-message)
     nil))
@@ -1506,6 +1627,7 @@ ARGS can contain additional arguments passed from the CLI."
   "Notify the user that Claude has finished and is awaiting input.
 
 TERMINAL is the eat terminal parameter (not used)."
+  (claude-code--set-session-status (current-buffer) 'waiting)
   (when claude-code-enable-notifications
     (funcall claude-code-notification-function
              "Claude Ready"
@@ -1521,6 +1643,7 @@ INPUT is the terminal output string."
              (claude-code--buffer-p (process-buffer process))
              ;; Ignore bells in OSC sequences (terminal title updates)
              (not (string-match-p "]0;.*\007" input)))
+    (claude-code--set-session-status (process-buffer process) 'waiting)
     (claude-code--notify nil))
 
   (funcall orig-fun process input))
@@ -1826,7 +1949,8 @@ This is useful for saying \"No\" when Claude asks for confirmation without
 having to switch to the REPL buffer."
   (interactive)
   (claude-code--with-buffer
-   (claude-code--term-send-string claude-code-terminal-backend (kbd "ESC"))))
+   (claude-code--term-send-string claude-code-terminal-backend (kbd "ESC"))
+   (claude-code--set-session-status (current-buffer) 'running)))
 
 ;;;###autoload
 (defun claude-code-send-file (file-path)
@@ -1950,6 +2074,481 @@ enter Claude commands."
        (claude-code-read-only-mode)
      (claude-code-exit-read-only-mode))))
 
+;;;; Session status tracking
+
+(defun claude-code--set-session-status (buffer status)
+  "Set the session STATUS for BUFFER and refresh the session list if visible."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (let ((old-status claude-code--session-status))
+        (setq claude-code--session-status status)
+        (when (and (eq status 'running) (not (eq old-status 'running)))
+          (setq claude-code--turn-start-time (current-time)))
+        (when (and (eq old-status 'running) (eq status 'waiting)
+                   claude-code--turn-start-time)
+          (setq claude-code--last-turn-duration
+                (float-time (time-subtract (current-time)
+                                           claude-code--turn-start-time)))
+          (setq claude-code--turn-start-time nil))
+        (when (not (eq old-status status))
+          (claude-code--audio-tasking-announce buffer old-status status)))))
+  (claude-code--session-list-refresh-if-visible))
+
+(defun claude-code--get-session-status (buffer)
+  "Get the session status for BUFFER.
+
+Returns `dead' if the process is no longer alive, otherwise returns
+the tracked status value."
+  (if (not (buffer-live-p buffer))
+      'dead
+    (with-current-buffer buffer
+      (let ((proc (get-buffer-process buffer)))
+        (if (and proc (process-live-p proc))
+            claude-code--session-status
+          'dead)))))
+
+(defun claude-code--format-session-status (status)
+  "Return a propertized string for STATUS with the appropriate face."
+  (pcase status
+    ('running (propertize "Working" 'face 'claude-code-session-status-working-face))
+    ('waiting (propertize "Needs Input" 'face 'claude-code-session-status-waiting-face))
+    ('dead (propertize "Dead" 'face 'claude-code-session-status-dead-face))
+    (_ (format "%s" status))))
+
+(defun claude-code--format-duration (seconds)
+  "Format SECONDS into a human-readable duration string."
+  (let ((secs (truncate seconds)))
+    (cond
+     ((>= secs 3600)
+      (format "%dh %dm" (/ secs 3600) (/ (% secs 3600) 60)))
+     ((>= secs 60)
+      (format "%dm %ds" (/ secs 60) (% secs 60)))
+     (t
+      (format "%ds" secs)))))
+
+(defun claude-code--format-turn-time (buffer)
+  "Return a formatted time string for BUFFER's current or last turn."
+  (if (not (buffer-live-p buffer))
+      ""
+    (with-current-buffer buffer
+      (cond
+       ((and (eq claude-code--session-status 'running)
+             claude-code--turn-start-time)
+        (propertize
+         (claude-code--format-duration
+          (float-time (time-subtract (current-time)
+                                     claude-code--turn-start-time)))
+         'face 'claude-code-session-status-working-face))
+       (claude-code--last-turn-duration
+        (claude-code--format-duration claude-code--last-turn-duration))
+       (t "")))))
+
+(defun claude-code--update-session-summary (buffer prompt)
+  "Update the session summary for BUFFER with PROMPT.
+
+Stores a cleaned and truncated version of the prompt string.
+Ignores slash commands and very short numeric responses."
+  (when (buffer-live-p buffer)
+    (let ((trimmed (string-trim prompt)))
+      (unless (or (string-empty-p trimmed)
+                  (string-prefix-p "/" trimmed)
+                  (string-match-p "\\`[0-9]\\{1,2\\}\\'" trimmed))
+        (with-current-buffer buffer
+          (setq claude-code--session-summary
+                (if (> (length trimmed) 80)
+                    (concat (substring trimmed 0 77) "...")
+                  trimmed)))))))
+
+;;;; Audio tasking
+
+(defun claude-code--tts-program ()
+  "Return the TTS program name for the current platform."
+  (or claude-code-audio-tts-program
+      (if (eq system-type 'darwin) "say" "espeak")))
+
+(defun claude-code--speak (text &optional callback)
+  "Speak TEXT aloud using the platform TTS program.
+
+Uses `say' on macOS and `espeak' on Linux by default, or
+the value of `claude-code-audio-tts-program'.  When CALLBACK is
+non-nil, call it with no arguments after speech finishes."
+  (let ((program (claude-code--tts-program)))
+    (if (executable-find program)
+        (let ((proc (apply #'start-process "claude-code-tts" nil program
+                           (append claude-code-audio-tts-args (list text)))))
+          (when callback
+            (set-process-sentinel
+             proc
+             (lambda (_proc event)
+               (when (string-match-p "finished" event)
+                 (funcall callback)))))
+          proc)
+      (when callback (funcall callback))
+      nil)))
+
+(defun claude-code--audio-tasking-announce (buffer old-status new-status)
+  "Announce a status transition for BUFFER via TTS.
+
+OLD-STATUS is the previous status, NEW-STATUS is the new one.
+When transitioning to `waiting', announces completion and optionally
+starts whisper recording.  When transitioning to `running' from
+`waiting', announces that Claude is working."
+  (when (and (buffer-live-p buffer)
+             (buffer-local-value 'claude-code--audio-tasking buffer))
+    (pcase new-status
+      ('waiting
+       (let* ((duration (buffer-local-value 'claude-code--last-turn-duration buffer))
+              (summary (buffer-local-value 'claude-code--session-summary buffer))
+              (msg (concat "Claude is ready."
+                           (when duration
+                             (format " Finished in %s."
+                                     (claude-code--format-duration duration)))
+                           (when summary
+                             (format " Task: %s." summary)))))
+         (claude-code--speak
+          msg
+          (lambda ()
+            (claude-code--audio-tasking-start-listening buffer)))))
+      ('running
+       (when (eq old-status 'waiting)
+         (claude-code--speak "Claude is working."))))))
+
+(defun claude-code--audio-tasking-start-listening (buffer)
+  "Start whisper recording to capture voice input for BUFFER.
+
+Only acts when BUFFER is live, has audio tasking enabled,
+`claude-code-audio-tasking-auto-listen' is non-nil, and
+the `whisper' package is available."
+  (when (and (buffer-live-p buffer)
+             (buffer-local-value 'claude-code--audio-tasking buffer)
+             claude-code-audio-tasking-auto-listen
+             (fboundp 'whisper-run))
+    (setq claude-code--audio-tasking-target-buffer buffer)
+    (whisper-run)))
+
+(defun claude-code--audio-tasking-transcription-handler ()
+  "Capture whisper output and send it to the target Claude session.
+
+This function is added to `whisper-after-transcription-hook'.
+The current buffer is the whisper stdout buffer containing
+the transcribed text.  After capturing, the buffer is erased
+to prevent whisper from inserting the text elsewhere."
+  (when-let ((target claude-code--audio-tasking-target-buffer))
+    (let ((text (string-trim (buffer-string))))
+      (setq claude-code--audio-tasking-target-buffer nil)
+      (erase-buffer)
+      (when (and (not (string-empty-p text)) (buffer-live-p target))
+        (with-current-buffer target
+          (claude-code--term-send-string claude-code-terminal-backend text)
+          (sit-for 0.1)
+          (claude-code--term-send-string claude-code-terminal-backend (kbd "RET")))
+        (claude-code--update-session-summary target text)
+        (claude-code--set-session-status target 'running)
+        (claude-code--speak
+         (format "Sent: %s"
+                 (if (> (length text) 80)
+                     (concat (substring text 0 77) "...")
+                   text)))))))
+
+;;;###autoload
+(defun claude-code-toggle-audio-tasking ()
+  "Toggle audio tasking for the current Claude session.
+
+When enabled, status changes are announced via TTS and voice
+input is automatically captured via `whisper-run' when Claude
+is waiting for input.  Use `whisper-run' again to stop recording."
+  (interactive)
+  (claude-code--with-buffer
+   (setq claude-code--audio-tasking (not claude-code--audio-tasking))
+   (if claude-code--audio-tasking
+       (progn
+         (claude-code--speak "Audio tasking enabled.")
+         (message "Audio tasking enabled for %s" (buffer-name)))
+     (setq claude-code--audio-tasking-target-buffer nil)
+     (claude-code--speak "Audio tasking disabled.")
+     (message "Audio tasking disabled for %s" (buffer-name)))))
+
+(defun claude-code-session-list-toggle-audio-tasking ()
+  "Toggle audio tasking for the session at point."
+  (interactive)
+  (if-let ((buf (claude-code--session-list-get-buffer-at-point)))
+      (if (buffer-live-p buf)
+          (with-current-buffer buf
+            (setq claude-code--audio-tasking (not claude-code--audio-tasking))
+            (if claude-code--audio-tasking
+                (progn
+                  (claude-code--speak "Audio tasking enabled.")
+                  (message "Audio tasking enabled for %s" (buffer-name)))
+              (setq claude-code--audio-tasking-target-buffer nil)
+              (claude-code--speak "Audio tasking disabled.")
+              (message "Audio tasking disabled for %s" (buffer-name))))
+        (message "Session buffer no longer exists")
+        (claude-code--session-list-refresh))
+    (message "No session at point")))
+
+(defun claude-code--session-status-event-handler (message)
+  "Handle `claude-code-event-hook' events to update session status.
+
+MESSAGE is a plist with :type, :buffer-name, and other keys."
+  (let ((type (plist-get message :type))
+        (buffer-name (plist-get message :buffer-name)))
+    (when-let ((buf (get-buffer buffer-name)))
+      (pcase type
+        ((or 'notification 'stop)
+         (claude-code--set-session-status buf 'waiting))
+        ('pre-tool-use
+         (claude-code--set-session-status buf 'running))
+        ('user-prompt-submit
+         (claude-code--set-session-status buf 'running)
+         (when-let ((json-data (plist-get message :json-data)))
+           (condition-case nil
+               (let* ((parsed (json-read-from-string json-data))
+                      (prompt (alist-get 'prompt parsed)))
+                 (when prompt
+                   (claude-code--update-session-summary buf prompt)))
+             (error nil)))))))
+  nil)
+
+;;;; Session list
+
+(defvar claude-code-session-list-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "RET") #'claude-code-session-list-switch-to-session)
+    (define-key map (kbd "o") #'claude-code-session-list-display-session)
+    (define-key map (kbd "g") #'claude-code-session-list-refresh)
+    (define-key map (kbd "y") #'claude-code-session-list-send-return)
+    (define-key map (kbd "n") #'claude-code-session-list-send-escape)
+    (define-key map (kbd "1") #'claude-code-session-list-send-1)
+    (define-key map (kbd "2") #'claude-code-session-list-send-2)
+    (define-key map (kbd "3") #'claude-code-session-list-send-3)
+    (define-key map (kbd "s") #'claude-code-session-list-send-command)
+    (define-key map (kbd "k") #'claude-code-session-list-kill-session)
+    (define-key map (kbd "K") #'claude-code-session-list-kill-all)
+    (define-key map (kbd "c") #'claude-code)
+    (define-key map (kbd "C") #'claude-code-continue)
+    (define-key map (kbd "R") #'claude-code-resume)
+    (define-key map (kbd "i") #'claude-code-new-instance)
+    (define-key map (kbd "d") #'claude-code-start-in-directory)
+    (define-key map (kbd "z") #'claude-code-session-list-toggle-read-only)
+    (define-key map (kbd "a") #'claude-code-session-list-toggle-audio-tasking)
+    (define-key map (kbd "/") #'claude-code-session-list-slash-commands)
+    (define-key map (kbd "?") #'claude-code-session-list-transient)
+    (define-key map (kbd "m") #'claude-code-session-list-transient)
+    map)
+  "Keymap for `claude-code-session-list-mode'.")
+
+(define-derived-mode claude-code-session-list-mode tabulated-list-mode
+  "Claude Sessions"
+  "Major mode for listing Claude Code sessions."
+  (setq tabulated-list-format [("Status" 12 t)
+                                ("Time" 10 t)
+                                ("Project" 20 t)
+                                ("Summary" 40 t)
+                                ("Directory" 30 t)])
+  (setq tabulated-list-padding 2)
+  (tabulated-list-init-header)
+  (add-hook 'kill-buffer-hook #'claude-code--session-list-stop-timer nil t))
+
+(defun claude-code--session-list-entries ()
+  "Generate tabulated list entries from all Claude buffers."
+  (let ((buffers (claude-code--find-all-claude-buffers)))
+    (mapcar
+     (lambda (buf)
+       (let* ((name (buffer-name buf))
+              (dir (or (claude-code--extract-directory-from-buffer-name name) ""))
+              (project (if (string-empty-p dir) ""
+                         (file-name-nondirectory (directory-file-name dir))))
+              (status (claude-code--get-session-status buf))
+              (time (claude-code--format-turn-time buf))
+              (summary (or (and (buffer-live-p buf)
+                                (buffer-local-value
+                                 'claude-code--session-summary buf))
+                           "")))
+         (list buf (vector (claude-code--format-session-status status)
+                           time
+                           project
+                           summary
+                           dir))))
+     buffers)))
+
+(defun claude-code--session-list-refresh ()
+  "Refresh the session list entries."
+  (setq tabulated-list-entries (claude-code--session-list-entries))
+  (tabulated-list-print t))
+
+(defun claude-code-session-list-refresh ()
+  "Refresh the session list display."
+  (interactive)
+  (when (derived-mode-p 'claude-code-session-list-mode)
+    (claude-code--session-list-refresh)))
+
+(defun claude-code--session-list-refresh-if-visible ()
+  "Refresh the session list if its buffer is visible."
+  (when-let ((buf (get-buffer claude-code--session-list-buffer-name)))
+    (when (get-buffer-window buf t)
+      (with-current-buffer buf
+        (claude-code--session-list-refresh)))))
+
+(defun claude-code--session-list-get-buffer-at-point ()
+  "Get the Claude buffer for the current row in the session list."
+  (tabulated-list-get-id))
+
+(defun claude-code-session-list-switch-to-session ()
+  "Switch to the Claude session at point."
+  (interactive)
+  (if-let ((buf (claude-code--session-list-get-buffer-at-point)))
+      (if (buffer-live-p buf)
+          (pop-to-buffer buf)
+        (message "Session buffer no longer exists")
+        (claude-code--session-list-refresh))
+    (message "No session at point")))
+
+(defun claude-code-session-list-display-session ()
+  "Display the Claude session at point without switching to it."
+  (interactive)
+  (if-let ((buf (claude-code--session-list-get-buffer-at-point)))
+      (if (buffer-live-p buf)
+          (display-buffer buf)
+        (message "Session buffer no longer exists")
+        (claude-code--session-list-refresh))
+    (message "No session at point")))
+
+(defun claude-code-session-list-send-return ()
+  "Send <return> to the session at point."
+  (interactive)
+  (claude-code--session-list-send-to-session ""))
+
+(defun claude-code-session-list-send-escape ()
+  "Send <escape> to the session at point."
+  (interactive)
+  (if-let ((buf (claude-code--session-list-get-buffer-at-point)))
+      (if (buffer-live-p buf)
+          (progn
+            (with-current-buffer buf
+              (claude-code--term-send-string claude-code-terminal-backend (kbd "ESC")))
+            (claude-code--set-session-status buf 'running))
+        (message "Session buffer no longer exists")
+        (claude-code--session-list-refresh))
+    (message "No session at point")))
+
+(defun claude-code-session-list-send-1 ()
+  "Send \"1\" to the session at point."
+  (interactive)
+  (claude-code--session-list-send-to-session "1"))
+
+(defun claude-code-session-list-send-2 ()
+  "Send \"2\" to the session at point."
+  (interactive)
+  (claude-code--session-list-send-to-session "2"))
+
+(defun claude-code-session-list-send-3 ()
+  "Send \"3\" to the session at point."
+  (interactive)
+  (claude-code--session-list-send-to-session "3"))
+
+(defun claude-code--session-list-send-to-session (cmd)
+  "Send CMD to the Claude session at point and update status."
+  (if-let ((buf (claude-code--session-list-get-buffer-at-point)))
+      (if (buffer-live-p buf)
+          (progn
+            (with-current-buffer buf
+              (claude-code--term-send-string claude-code-terminal-backend cmd)
+              (sit-for 0.1)
+              (claude-code--term-send-string claude-code-terminal-backend (kbd "RET")))
+            (claude-code--update-session-summary buf cmd)
+            (claude-code--set-session-status buf 'running))
+        (message "Session buffer no longer exists")
+        (claude-code--session-list-refresh))
+    (message "No session at point")))
+
+(defun claude-code-session-list-send-command ()
+  "Read a command from the minibuffer and send it to the session at point."
+  (interactive)
+  (let ((cmd (read-string "Claude command: " nil 'claude-code-command-history)))
+    (claude-code--session-list-send-to-session cmd)))
+
+(defun claude-code-session-list-kill-session ()
+  "Kill the Claude session at point."
+  (interactive)
+  (if-let ((buf (claude-code--session-list-get-buffer-at-point)))
+      (if (buffer-live-p buf)
+          (if claude-code-confirm-kill
+              (when (yes-or-no-p "Kill this Claude session? ")
+                (claude-code--kill-buffer buf)
+                (claude-code--session-list-refresh)
+                (message "Claude session killed"))
+            (claude-code--kill-buffer buf)
+            (claude-code--session-list-refresh)
+            (message "Claude session killed"))
+        (message "Session buffer no longer exists")
+        (claude-code--session-list-refresh))
+    (message "No session at point")))
+
+(defun claude-code-session-list-kill-all ()
+  "Kill all Claude sessions."
+  (interactive)
+  (claude-code--kill-all-instances)
+  (claude-code--session-list-refresh))
+
+(defun claude-code-session-list-toggle-read-only ()
+  "Toggle read-only mode for the session at point."
+  (interactive)
+  (if-let ((buf (claude-code--session-list-get-buffer-at-point)))
+      (if (buffer-live-p buf)
+          (with-current-buffer buf
+            (if (not (claude-code--term-in-read-only-p claude-code-terminal-backend))
+                (progn
+                  (claude-code--term-read-only-mode claude-code-terminal-backend)
+                  (message "Read-only mode enabled"))
+              (claude-code--term-interactive-mode claude-code-terminal-backend)
+              (message "Read-only mode disabled")))
+        (message "Session buffer no longer exists")
+        (claude-code--session-list-refresh))
+    (message "No session at point")))
+
+(defun claude-code-session-list-slash-commands ()
+  "Open slash commands for the session at point."
+  (interactive)
+  (if-let ((buf (claude-code--session-list-get-buffer-at-point)))
+      (if (buffer-live-p buf)
+          (let ((claude-code--directory-buffer-map
+                 (let ((map (make-hash-table :test 'equal)))
+                   (puthash (or (claude-code--extract-directory-from-buffer-name
+                                 (buffer-name buf))
+                                default-directory)
+                            buf map)
+                   map)))
+            (claude-code-slash-commands))
+        (message "Session buffer no longer exists")
+        (claude-code--session-list-refresh))
+    (message "No session at point")))
+
+(defun claude-code--session-list-start-timer ()
+  "Start the auto-refresh timer for the session list."
+  (claude-code--session-list-stop-timer)
+  (when claude-code-session-list-auto-refresh-interval
+    (setq claude-code--session-list-timer
+          (run-at-time claude-code-session-list-auto-refresh-interval
+                       claude-code-session-list-auto-refresh-interval
+                       #'claude-code--session-list-refresh-if-visible))))
+
+(defun claude-code--session-list-stop-timer ()
+  "Cancel the auto-refresh timer for the session list."
+  (when claude-code--session-list-timer
+    (cancel-timer claude-code--session-list-timer)
+    (setq claude-code--session-list-timer nil)))
+
+;;;###autoload
+(defun claude-code-session-list ()
+  "Display a list of all Claude Code sessions."
+  (interactive)
+  (let ((buf (get-buffer-create claude-code--session-list-buffer-name)))
+    (with-current-buffer buf
+      (claude-code-session-list-mode)
+      (claude-code--session-list-refresh))
+    (pop-to-buffer buf)
+    (claude-code--session-list-start-timer)))
+
 ;;;; Mode definition
 ;;;###autoload
 (define-minor-mode claude-code-mode
@@ -1961,6 +2560,12 @@ and managing Claude sessions."
   :lighter " Claude"
   :global t
   :group 'claude-code)
+
+;;;; Hook registrations
+(add-hook 'claude-code-event-hook #'claude-code--session-status-event-handler)
+(with-eval-after-load 'whisper
+  (add-hook 'whisper-after-transcription-hook
+            #'claude-code--audio-tasking-transcription-handler))
 
 ;;;; Provide the feature
 (provide 'claude-code)

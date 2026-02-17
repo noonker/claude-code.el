@@ -362,7 +362,7 @@ This enables interactive workflows like permission prompts where hooks can influ
 2. **Start the Emacs server** so that `emacsclient` can communicate with your Emacs instance:
    ```elisp
    ;; Start the Emacs server (add this to your init.el)
-   (start-server)
+   (server-start)
 
    ;; Add your hook listeners using standard Emacs functions
    (add-hook 'claude-code-event-hook 'my-claude-hook-listener)

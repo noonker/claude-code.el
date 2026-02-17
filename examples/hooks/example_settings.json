@@ -47,6 +47,17 @@
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "claude-code-hook-wrapper user-prompt-submit"
+          }
+        ]
+      }
     ]
   }
 }
