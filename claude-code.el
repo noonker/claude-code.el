@@ -2250,6 +2250,16 @@ to prevent whisper from inserting the text elsewhere."
                      (concat (substring text 0 77) "...")
                    text)))))))
 
+(defun claude-code--whisper-run-set-target (&rest _args)
+  "Set whisper target buffer when called from a Claude buffer.
+
+Allows `whisper-run' to work directly from Claude buffers without
+requiring audio tasking to be enabled.  The transcription handler
+will send the text to the terminal instead of trying to insert it."
+  (when (and (claude-code--buffer-p (current-buffer))
+             (not claude-code--audio-tasking-target-buffer))
+    (setq claude-code--audio-tasking-target-buffer (current-buffer))))
+
 ;;;###autoload
 (defun claude-code-toggle-audio-tasking ()
   "Toggle audio tasking for the current Claude session.
@@ -2383,11 +2393,32 @@ MESSAGE is a plist with :type, :buffer-name, and other keys."
     (claude-code--session-list-refresh)))
 
 (defun claude-code--session-list-refresh-if-visible ()
-  "Refresh the session list if its buffer is visible."
+  "Refresh the session list if its buffer is visible.
+
+Saves and restores the window point for each window displaying
+the session list buffer, using line numbers to handle content
+changes gracefully."
   (when-let ((buf (get-buffer claude-code--session-list-buffer-name)))
-    (when (get-buffer-window buf t)
-      (with-current-buffer buf
-        (claude-code--session-list-refresh)))))
+    (let ((windows (get-buffer-window-list buf nil t)))
+      (when windows
+        (let ((saved-lines
+               (mapcar (lambda (win)
+                         (cons win (with-current-buffer buf
+                                     (save-excursion
+                                       (goto-char (window-point win))
+                                       (line-number-at-pos)))))
+                       windows)))
+          (with-current-buffer buf
+            (claude-code--session-list-refresh))
+          (dolist (entry saved-lines)
+            (let ((win (car entry))
+                  (line (cdr entry)))
+              (when (window-live-p win)
+                (with-current-buffer buf
+                  (save-excursion
+                    (goto-char (point-min))
+                    (forward-line (1- line))
+                    (set-window-point win (point))))))))))))
 
 (defun claude-code--session-list-get-buffer-at-point ()
   "Get the Claude buffer for the current row in the session list."
@@ -2564,6 +2595,7 @@ and managing Claude sessions."
 ;;;; Hook registrations
 (add-hook 'claude-code-event-hook #'claude-code--session-status-event-handler)
 (with-eval-after-load 'whisper
+  (advice-add 'whisper-run :before #'claude-code--whisper-run-set-target)
   (add-hook 'whisper-after-transcription-hook
             #'claude-code--audio-tasking-transcription-handler))
 
